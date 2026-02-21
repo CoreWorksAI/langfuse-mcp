@@ -1,50 +1,68 @@
-# Langfuse MCP Server
+# Langfuse MCP Server (Multi-Environment Fork)
 
-[![PyPI](https://badge.fury.io/py/langfuse-mcp.svg)](https://badge.fury.io/py/langfuse-mcp)
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10–3.13-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-[Model Context Protocol](https://modelcontextprotocol.io) server for [Langfuse](https://langfuse.com) observability. Query traces, debug errors, analyze sessions, manage prompts.
+Fork of [avivsinai/langfuse-mcp](https://github.com/avivsinai/langfuse-mcp) (v0.5.2) with **multi-environment support**. Switch between dev, prod, and local Langfuse instances using a single `env` parameter on every tool.
 
-## Why langfuse-mcp?
+## Multi-Environment Setup
 
-Comparison with [official Langfuse MCP](https://github.com/langfuse/mcp-server-langfuse) (as of Jan 2026):
+### 1. Create `config.json`
 
-| | langfuse-mcp | Official |
-|-|--------------|----------|
-| **Traces & Observations** | Yes | No |
-| **Sessions & Users** | Yes | No |
-| **Exception Tracking** | Yes | No |
-| **Prompt Management** | Yes | Yes |
-| **Dataset Management** | Yes | No |
-| **Selective Tool Loading** | Yes | No |
+Copy `config.example.json` and fill in your credentials:
 
-This project provides a **full observability toolkit** — traces, observations, sessions, exceptions, and prompts — while the official MCP focuses on prompt management.
-
-## Quick Start
-
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (for `uvx`).
-
-Get credentials from [Langfuse Cloud](https://cloud.langfuse.com) → Settings → API Keys. If self-hosted, use your instance URL for `LANGFUSE_HOST`.
-
-```bash
-# Claude Code (project-scoped, shared via .mcp.json)
-claude mcp add \
-  -e LANGFUSE_PUBLIC_KEY=pk-... \
-  -e LANGFUSE_SECRET_KEY=sk-... \
-  -e LANGFUSE_HOST=https://cloud.langfuse.com \
-  --scope project \
-  langfuse -- uvx --python 3.11 langfuse-mcp
-
-# Codex CLI (user-scoped, stored in ~/.codex/config.toml)
-codex mcp add langfuse \
-  --env LANGFUSE_PUBLIC_KEY=pk-... \
-  --env LANGFUSE_SECRET_KEY=sk-... \
-  --env LANGFUSE_HOST=https://cloud.langfuse.com \
-  -- uvx --python 3.11 langfuse-mcp
+```json
+{
+  "default_env": "dev",
+  "environments": {
+    "dev": {
+      "host": "http://your-dev-langfuse:3000",
+      "public_key": "pk-lf-...",
+      "secret_key": "sk-lf-..."
+    },
+    "prod": {
+      "host": "http://your-prod-langfuse:3000",
+      "public_key": "pk-lf-...",
+      "secret_key": "sk-lf-..."
+    },
+    "local": {
+      "host": "http://localhost:3000",
+      "public_key": "pk-lf-...",
+      "secret_key": "sk-lf-..."
+    }
+  }
+}
 ```
 
-Restart your CLI, then verify with `/mcp` (Claude Code) or `codex mcp list` (Codex).
+`config.json` is gitignored. Path configurable via `LANGFUSE_MCP_CONFIG` env var.
+
+### 2. Register with Claude Code
+
+```bash
+claude mcp add langfuse \
+  -e LANGFUSE_MCP_CONFIG=/path/to/langfuse_mcp/config.json \
+  -- /path/to/langfuse_mcp/.venv/bin/langfuse-mcp \
+  --tools traces,observations,sessions,exceptions,prompts --read-only
+```
+
+### 3. Use the `env` parameter
+
+Every tool accepts an optional `env` parameter:
+
+```
+# Uses default_env (dev)
+fetch_traces(age=60)
+
+# Explicitly target prod
+fetch_traces(age=60, env="prod")
+
+# Query local instance
+fetch_trace(trace_id="abc123", env="local")
+```
+
+### Backward Compatibility
+
+Without `config.json`, the server falls back to standard single-environment mode using `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST` env vars or CLI args — identical to the upstream behavior.
 
 ## Tools (25 total)
 

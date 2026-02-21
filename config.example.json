@@ -1,0 +1,20 @@
+{
+  "default_env": "dev",
+  "environments": {
+    "dev": {
+      "host": "https://your-dev-langfuse.example.com",
+      "public_key": "pk-lf-...",
+      "secret_key": "sk-lf-..."
+    },
+    "prod": {
+      "host": "https://your-prod-langfuse.example.com",
+      "public_key": "pk-lf-...",
+      "secret_key": "sk-lf-..."
+    },
+    "local": {
+      "host": "http://localhost:3000",
+      "public_key": "pk-lf-...",
+      "secret_key": "sk-lf-..."
+    }
+  }
+}

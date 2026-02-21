@@ -1,62 +1,65 @@
 ---
 name: langfuse
-version: 1.0.2
-description: Debug AI traces, find exceptions, analyze sessions, and manage prompts via Langfuse MCP. Also handles MCP setup and configuration.
+version: 1.1.0
+description: Debug AI traces, find exceptions, analyze sessions, and manage prompts via Langfuse MCP. Multi-environment support (dev/prod/local).
 metadata:
-  short-description: Langfuse observability via MCP
+  short-description: Langfuse observability via MCP (multi-env)
   compatibility: claude-code, codex-cli
 ---
 
 # Langfuse Skill
 
-Debug your AI systems through Langfuse observability.
+Debug your AI systems through Langfuse observability. Supports multiple environments via `env` parameter.
 
 **Triggers:** langfuse, traces, debug AI, find exceptions, set up langfuse, what went wrong, why is it slow, datasets, evaluation sets
 
-## Setup
+## Multi-Environment
 
-**Step 1:** Get credentials from https://cloud.langfuse.com → Settings → API Keys
+Every tool accepts an optional `env` parameter. Omit to use the default environment.
 
-If self-hosted, use your instance URL for `LANGFUSE_HOST` and create keys there.
-
-**Step 2:** Install MCP (pick one):
-
-```bash
-# Claude Code (project-scoped, shared via .mcp.json)
-claude mcp add \
-  --scope project \
-  --env LANGFUSE_PUBLIC_KEY=pk-... \
-  --env LANGFUSE_SECRET_KEY=sk-... \
-  --env LANGFUSE_HOST=https://cloud.langfuse.com \
-  langfuse -- uvx --python 3.11 langfuse-mcp
-
-# Codex CLI (user-scoped, stored in ~/.codex/config.toml)
-codex mcp add langfuse \
-  --env LANGFUSE_PUBLIC_KEY=pk-... \
-  --env LANGFUSE_SECRET_KEY=sk-... \
-  --env LANGFUSE_HOST=https://cloud.langfuse.com \
-  -- uvx --python 3.11 langfuse-mcp
+```
+fetch_traces(age=60)                  # uses default env
+fetch_traces(age=60, env="prod")      # target prod
+fetch_trace(trace_id="...", env="local")  # target local
 ```
 
-**Step 3:** Restart CLI, verify with `/mcp` (Claude) or `codex mcp list` (Codex)
+Available environments are configured in `config.json`.
 
-**Step 4:** Test: `fetch_traces(age=60)`
+---
 
-### Read-Only Mode
+## CRITICAL: Context Management Rules
 
-For safer observability without risk of modifying prompts or datasets, enable read-only mode:
+MCP responses can be very large (10k+ tokens). **Always drill down progressively** to avoid filling up context.
 
-```bash
-# CLI flag
-langfuse-mcp --read-only
-
-# Or environment variable
-LANGFUSE_MCP_READ_ONLY=true
+### Rule 1: Start with aggregates and small result sets
+```
+get_error_count(age=1440)                              # just a number
+find_exceptions(age=60, group_by="file")               # aggregated counts
+fetch_traces(age=60, limit=5)                          # small limit
 ```
 
-This disables write tools: `create_text_prompt`, `create_chat_prompt`, `update_prompt_labels`, `create_dataset`, `create_dataset_item`, `delete_dataset_item`.
+### Rule 2: Fetch traces WITHOUT observations first
+```
+fetch_trace(trace_id="...")                            # metadata only
+get_session_details(session_id="...")                   # overview only
+```
 
-For manual `.mcp.json` setup or troubleshooting, see `references/setup.md`.
+### Rule 3: Only add include_observations when you need it
+```
+fetch_trace(trace_id="...", include_observations=true)  # ONLY for specific traces
+fetch_observation(observation_id="...")                  # single observation
+```
+
+### Rule 4: Use full_json_file for large responses
+```
+fetch_trace(trace_id="...", include_observations=true, output_mode="full_json_file")
+```
+Then use the Read tool on the returned file path to inspect specific parts.
+
+### NEVER do this:
+- `fetch_traces(age=1440, include_observations=true)` — fetches everything
+- `get_session_details(..., include_observations=true)` as a first call
+- `output_mode="full_json_string"` on large traces — puts entire JSON inline
 
 ---
 
@@ -65,9 +68,14 @@ For manual `.mcp.json` setup or troubleshooting, see `references/setup.md`.
 ### "Where are the errors?"
 
 ```
+get_error_count(age=1440)
+```
+→ Quick count. If non-zero, drill down:
+
+```
 find_exceptions(age=1440, group_by="file")
 ```
-→ Shows error counts by file. Pick the worst offender.
+→ Error counts by file. Pick the worst offender.
 
 ```
 find_exceptions_in_file(filepath="src/ai/chat.py", age=1440)
@@ -84,19 +92,19 @@ get_exception_details(trace_id="...")
 ### "What happened in this interaction?"
 
 ```
-fetch_traces(age=60, user_id="...")
+fetch_traces(age=60, user_id="...", limit=10)
 ```
 → Find the trace. Note the trace_id.
 
-If you don't know the user_id, start with:
 ```
-fetch_traces(age=60)
+fetch_trace(trace_id="...")
 ```
+→ Get trace metadata first (without observations).
 
 ```
 fetch_trace(trace_id="...", include_observations=true)
 ```
-→ See all LLM calls in the trace.
+→ Only if you need to see all LLM calls in the trace.
 
 ```
 fetch_observation(observation_id="...")
@@ -108,7 +116,7 @@ fetch_observation(observation_id="...")
 ### "Why is it slow?"
 
 ```
-fetch_observations(age=60, type="GENERATION")
+fetch_observations(age=60, type="GENERATION", limit=10)
 ```
 → Find recent LLM calls. Look for high latency.
 
@@ -129,7 +137,7 @@ get_user_sessions(user_id="...", age=1440)
 ```
 get_session_details(session_id="...")
 ```
-→ See all traces in the session.
+→ See all traces in the session (without observations first).
 
 ---
 

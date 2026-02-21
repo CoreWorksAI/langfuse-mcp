@@ -237,6 +237,29 @@ def _load_env_file(env_path: Path | None = None) -> None:
         logger.warning(f"Unable to load environment file {env_path}: {exc}")
 
 
+def _load_multi_env_config() -> dict[str, Any] | None:
+    """Load multi-environment config from JSON file.
+
+    Returns config dict with 'default_env' and 'environments' keys, or None if not found.
+    Path via LANGFUSE_MCP_CONFIG env var (default: ./config.json).
+    """
+    config_path = Path(os.getenv("LANGFUSE_MCP_CONFIG", "./config.json"))
+    if not config_path.exists():
+        return None
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+        envs = config.get("environments", {})
+        if not envs:
+            logger.warning(f"Config {config_path} has no environments defined")
+            return None
+        logger.info(f"Loaded multi-env config from {config_path}: {list(envs.keys())}")
+        return config
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning(f"Failed to load config {config_path}: {exc}")
+        return None
+
+
 def _read_env_defaults() -> dict[str, Any]:
     """Read environment defaults used by the CLI."""
     # Parse timeout with fallback to our default of 30s (SDK defaults to 5s which is too aggressive)
@@ -257,20 +280,22 @@ def _read_env_defaults() -> dict[str, Any]:
 
 def _build_arg_parser(env_defaults: dict[str, Any]) -> argparse.ArgumentParser:
     """Construct the CLI argument parser using provided defaults."""
+    # Keys not required when multi-env config.json exists
+    has_config = _load_multi_env_config() is not None
     parser = argparse.ArgumentParser(description="Langfuse MCP Server")
     parser.add_argument(
         "--public-key",
         type=str,
         default=env_defaults["public_key"],
-        required=env_defaults["public_key"] is None,
-        help="Langfuse public key",
+        required=not has_config and env_defaults["public_key"] is None,
+        help="Langfuse public key (not needed with config.json)",
     )
     parser.add_argument(
         "--secret-key",
         type=str,
         default=env_defaults["secret_key"],
-        required=env_defaults["secret_key"] is None,
-        help="Langfuse secret key",
+        required=not has_config and env_defaults["secret_key"] is None,
+        help="Langfuse secret key (not needed with config.json)",
     )
     parser.add_argument("--host", type=str, default=env_defaults["host"], help="Langfuse host URL")
     parser.add_argument(
@@ -915,11 +940,12 @@ def process_data_with_mode(
 class MCPState:
     """State object passed from lifespan context to tools.
 
-    Contains the Langfuse client instance and various caches used to optimize
-    performance when querying and filtering observations and exceptions.
+    Contains Langfuse client instances (one per environment) and various caches
+    used to optimize performance when querying and filtering observations and exceptions.
     """
 
-    langfuse_client: Langfuse
+    clients: dict[str, Langfuse]
+    default_env: str
     # LRU caches for efficient exception lookup
     observation_cache: LRUCache = field(
         default_factory=lambda: LRUCache(maxsize=100), metadata={"description": "Cache for observations to reduce API calls"}
@@ -936,6 +962,18 @@ class MCPState:
     dump_dir: str | None = field(
         default=None, metadata={"description": "Directory to save full JSON dumps when 'output_mode' is 'full_json_file'"}
     )
+
+    @property
+    def langfuse_client(self) -> Langfuse:
+        """Default client for backward compatibility."""
+        return self.clients[self.default_env]
+
+    def get_client(self, env: str | None = None) -> Langfuse:
+        """Get Langfuse client for the specified environment."""
+        env = env or self.default_env
+        if env not in self.clients:
+            raise ValueError(f"Unknown env '{env}'. Available: {list(self.clients.keys())}")
+        return self.clients[env]
 
 
 class ExceptionCount(BaseModel):
@@ -998,7 +1036,7 @@ def _get_cached_observation(langfuse_client: Langfuse, observation_id: str) -> A
 
 
 async def _efficient_fetch_observations(
-    state: MCPState, from_timestamp: datetime, to_timestamp: datetime, filepath: str | None = None
+    state: MCPState, from_timestamp: datetime, to_timestamp: datetime, filepath: str | None = None, env: str | None = None
 ) -> dict[str, Any]:
     """Efficiently fetch observations with exception filtering.
 
@@ -1011,7 +1049,7 @@ async def _efficient_fetch_observations(
     Returns:
         Dictionary of observation_id -> observation
     """
-    langfuse_client = state.langfuse_client
+    langfuse_client = state.get_client(env)
 
     # Use a cache key that includes the time range
     cache_key = f"{from_timestamp.isoformat()}-{to_timestamp.isoformat()}"
@@ -1084,7 +1122,7 @@ async def _efficient_fetch_observations(
     return observations
 
 
-async def _embed_observations_in_traces(state: MCPState, traces: list[Any]) -> None:
+async def _embed_observations_in_traces(state: MCPState, traces: list[Any], env: str | None = None) -> None:
     """Fetch and embed full observation objects into traces.
 
     This replaces the observation IDs list with a list of the actual observation objects.
@@ -1119,7 +1157,7 @@ async def _embed_observations_in_traces(state: MCPState, traces: list[Any]) -> N
         full_observations = []
         for obs_id in observation_refs:
             try:
-                obs = _get_observation(state.langfuse_client, obs_id)
+                obs = _get_observation(state.get_client(env), obs_id)
                 obs_data = _sdk_object_to_python(obs)
                 full_observations.append(obs_data)
                 logger.debug(f"Fetched observation {obs_id} for trace {trace.get('id', 'unknown')}")
@@ -1133,6 +1171,7 @@ async def _embed_observations_in_traces(state: MCPState, traces: list[Any]) -> N
 
 async def fetch_traces(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     age: ValidatedAge = Field(..., description="Minutes ago to start looking (e.g., 1440 for 24 hours)", gt=0, le=MAX_AGE_MINUTES),
     name: str | None = Field(None, description="Name of the trace to filter by"),
     user_id: str | None = Field(None, description="User ID to filter traces by"),
@@ -1177,7 +1216,7 @@ async def fetch_traces(
 
         # Use the resource-style API when available (Langfuse v3) with fallback to v2 helpers
         trace_items, pagination = _list_traces(
-            state.langfuse_client,
+            state.get_client(env),
             limit=limit,
             page=page,
             include_observations=include_observations,
@@ -1195,7 +1234,7 @@ async def fetch_traces(
         # If include_observations is True, fetch and embed the full observation objects
         if include_observations and raw_traces:
             logger.info(f"Fetching full observation details for {sum(len(t.get('observations', [])) for t in raw_traces)} observations")
-            await _embed_observations_in_traces(state, raw_traces)
+            await _embed_observations_in_traces(state, raw_traces, env=env)
 
         # Process based on output mode
         mode = _ensure_output_mode(output_mode)
@@ -1228,6 +1267,7 @@ async def fetch_traces(
 
 async def fetch_trace(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     trace_id: str = Field(..., description="The ID of the trace to fetch (unique identifier string)"),
     include_observations: bool = Field(
         False,
@@ -1279,7 +1319,7 @@ async def fetch_trace(
 
     try:
         # Use the resource-style API when available
-        trace = _get_trace(state.langfuse_client, trace_id, include_observations)
+        trace = _get_trace(state.get_client(env), trace_id, include_observations)
 
         # Convert response to a serializable format
         raw_trace = _sdk_object_to_python(trace)
@@ -1293,7 +1333,7 @@ async def fetch_trace(
             embedded = raw_trace.get("observations", []) if isinstance(raw_trace, dict) else []
             if embedded and isinstance(embedded[0], str):
                 logger.info(f"Fetching full observation details for {len(embedded)} observations")
-                await _embed_observations_in_traces(state, [raw_trace])
+                await _embed_observations_in_traces(state, [raw_trace], env=env)
 
         # Process based on output mode
         mode = _ensure_output_mode(output_mode)
@@ -1321,6 +1361,7 @@ async def fetch_trace(
 
 async def fetch_observations(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     type: Literal["SPAN", "GENERATION", "EVENT"] | None = Field(
         None, description="The observation type to filter by ('SPAN', 'GENERATION', or 'EVENT')"
     ),
@@ -1371,7 +1412,7 @@ async def fetch_observations(
 
     try:
         observation_items, pagination = _list_observations(
-            state.langfuse_client,
+            state.get_client(env),
             limit=limit,
             page=page,
             from_start_time=from_start_time,
@@ -1418,6 +1459,7 @@ async def fetch_observations(
 
 async def fetch_observation(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     observation_id: str = Field(..., description="The ID of the observation to fetch (unique identifier string)"),
     output_mode: OUTPUT_MODE_LITERAL = Field(
         "compact",
@@ -1446,7 +1488,7 @@ async def fetch_observation(
 
     try:
         # Use the resource-style API when available
-        observation = _get_observation(state.langfuse_client, observation_id)
+        observation = _get_observation(state.get_client(env), observation_id)
 
         # Convert response to a serializable format
         raw_observation = _sdk_object_to_python(observation)
@@ -1473,6 +1515,7 @@ async def fetch_observation(
 
 async def fetch_sessions(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     age: ValidatedAge = Field(..., description="Minutes ago to start looking (e.g., 1440 for 24 hours)", gt=0, le=MAX_AGE_MINUTES),
     page: int = Field(1, description="Page number for pagination (starts at 1)"),
     limit: int = Field(50, description="Maximum number of sessions to return per page"),
@@ -1510,7 +1553,7 @@ async def fetch_sessions(
 
     try:
         session_items, pagination = _list_sessions(
-            state.langfuse_client,
+            state.get_client(env),
             limit=limit,
             page=page,
             from_timestamp=from_timestamp,
@@ -1545,6 +1588,7 @@ async def fetch_sessions(
 
 async def get_session_details(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     session_id: str = Field(..., description="The ID of the session to retrieve (unique identifier string)"),
     include_observations: bool = Field(
         False,
@@ -1591,7 +1635,7 @@ async def get_session_details(
     try:
         # Fetch traces with this session ID
         trace_items, pagination = _list_traces(
-            state.langfuse_client,
+            state.get_client(env),
             limit=50,
             page=1,
             include_observations=include_observations,
@@ -1626,7 +1670,7 @@ async def get_session_details(
             total_observations = sum(len(t.get("observations", [])) for t in raw_traces)
             if total_observations > 0:
                 logger.info(f"Fetching full observation details for {total_observations} observations across {len(raw_traces)} traces")
-                await _embed_observations_in_traces(state, raw_traces)
+                await _embed_observations_in_traces(state, raw_traces, env=env)
 
         # Create a session object with all traces that have this session ID
         session = {
@@ -1661,6 +1705,7 @@ async def get_session_details(
 
 async def get_user_sessions(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     user_id: str = Field(..., description="The ID of the user to retrieve sessions for"),
     age: ValidatedAge = Field(..., description="Minutes ago to start looking (e.g., 1440 for 24 hours)", gt=0, le=MAX_AGE_MINUTES),
     include_observations: bool = Field(
@@ -1716,7 +1761,7 @@ async def get_user_sessions(
 
         # Fetch traces for this user
         trace_items, pagination = _list_traces(
-            state.langfuse_client,
+            state.get_client(env),
             limit=100,
             page=1,
             include_observations=include_observations,
@@ -1736,7 +1781,7 @@ async def get_user_sessions(
             total_observations = sum(len(t.get("observations", [])) for t in raw_traces)
             if total_observations > 0:
                 logger.info(f"Fetching full observation details for {total_observations} observations across {len(raw_traces)} traces")
-                await _embed_observations_in_traces(state, raw_traces)
+                await _embed_observations_in_traces(state, raw_traces, env=env)
 
         # Group traces by session_id
         sessions_dict: dict[str, dict[str, Any]] = {}
@@ -1803,6 +1848,7 @@ async def get_user_sessions(
 
 async def find_exceptions(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     age: ValidatedAge = Field(
         ..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=MAX_AGE_MINUTES
     ),
@@ -1835,7 +1881,7 @@ async def find_exceptions(
     try:
         # Fetch all SPAN observations since they may contain exceptions
         observation_items, _ = _list_observations(
-            state.langfuse_client,
+            state.get_client(env),
             limit=100,
             page=1,
             from_start_time=from_timestamp,
@@ -1893,6 +1939,7 @@ async def find_exceptions(
 
 async def find_exceptions_in_file(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     filepath: str = Field(..., description="Path to the file to search for exceptions (full path including extension)"),
     age: ValidatedAge = Field(
         ..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=MAX_AGE_MINUTES
@@ -1932,7 +1979,7 @@ async def find_exceptions_in_file(
     try:
         # Fetch all SPAN observations since they may contain exceptions
         observation_items, _ = _list_observations(
-            state.langfuse_client,
+            state.get_client(env),
             limit=100,
             page=1,
             from_start_time=from_timestamp,
@@ -2008,6 +2055,7 @@ async def find_exceptions_in_file(
 
 async def get_exception_details(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     trace_id: str = Field(..., description="The ID of the trace to analyze for exceptions (unique identifier string)"),
     span_id: str | None = Field(None, description="Optional span ID to filter by specific span (unique identifier string)"),
     output_mode: OUTPUT_MODE_LITERAL = Field(
@@ -2038,7 +2086,7 @@ async def get_exception_details(
 
     try:
         # First get the trace details
-        trace = _get_trace(state.langfuse_client, trace_id, include_observations=False)
+        trace = _get_trace(state.get_client(env), trace_id, include_observations=False)
         trace_data = _sdk_object_to_python(trace)
         mode = _ensure_output_mode(output_mode)
         if not trace_data:
@@ -2053,7 +2101,7 @@ async def get_exception_details(
 
         # Get all observations for this trace
         observation_items, _ = _list_observations(
-            state.langfuse_client,
+            state.get_client(env),
             limit=100,
             page=1,
             from_start_time=None,
@@ -2147,6 +2195,7 @@ async def get_exception_details(
 
 async def get_error_count(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     age: ValidatedAge = Field(
         ..., description="Number of minutes to look back (positive integer, max 7 days/10080 minutes)", gt=0, le=MAX_AGE_MINUTES
     ),
@@ -2171,7 +2220,7 @@ async def get_error_count(
     try:
         # Fetch all SPAN observations since they may contain exceptions
         observation_items, _ = _list_observations(
-            state.langfuse_client,
+            state.get_client(env),
             limit=100,
             page=1,
             from_start_time=from_timestamp,
@@ -2224,7 +2273,7 @@ async def get_error_count(
         raise
 
 
-async def get_data_schema(ctx: Context, dummy: str = "") -> str:
+async def get_data_schema(ctx: Context, env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."), dummy: str = "") -> str:
     """Get schema of trace, span and event objects.
 
     Args:
@@ -2340,6 +2389,7 @@ Scores are evaluations attached to traces or observations.
 
 async def get_prompt(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="The name of the prompt to fetch"),
     label: str | None = Field(
         None,
@@ -2389,7 +2439,7 @@ async def get_prompt(
         if version:
             kwargs["version"] = version
 
-        prompt = state.langfuse_client.get_prompt(**kwargs)
+        prompt = state.get_client(env).get_prompt(**kwargs)
 
         if prompt is None:
             label_msg = f" with label '{label}'" if label else ""
@@ -2442,6 +2492,7 @@ async def get_prompt(
 
 async def get_prompt_unresolved(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="The name of the prompt to fetch"),
     label: str | None = Field(
         None,
@@ -2485,16 +2536,16 @@ async def get_prompt_unresolved(
             api_kwargs["version"] = version
 
         # Access the prompts API directly.
-        if not hasattr(state.langfuse_client, "api") or not hasattr(state.langfuse_client.api, "prompts"):
+        if not hasattr(state.get_client(env), "api") or not hasattr(state.get_client(env).api, "prompts"):
             raise RuntimeError("Langfuse SDK does not expose prompts.get; upgrade the SDK to use this tool.")
-        if not hasattr(state.langfuse_client.api.prompts, "get"):
+        if not hasattr(state.get_client(env).api.prompts, "get"):
             raise RuntimeError("Langfuse SDK does not expose prompts.get; upgrade the SDK to use this tool.")
-        supports_resolve = _prompts_get_supports_resolve(state.langfuse_client.api.prompts)
+        supports_resolve = _prompts_get_supports_resolve(state.get_client(env).api.prompts)
         try:
             if supports_resolve:
-                prompt_response = _prompts_get(state.langfuse_client.api.prompts, name=name, resolve=False, **api_kwargs)
+                prompt_response = _prompts_get(state.get_client(env).api.prompts, name=name, resolve=False, **api_kwargs)
             else:
-                prompt_response = _prompts_get(state.langfuse_client.api.prompts, name=name, **api_kwargs)
+                prompt_response = _prompts_get(state.get_client(env).api.prompts, name=name, **api_kwargs)
         except TypeError as e:
             msg = str(e)
             if "resolve" in msg or "unexpected keyword" in msg:
@@ -2524,6 +2575,7 @@ async def get_prompt_unresolved(
 
 async def list_prompts(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str | None = Field(None, description="Filter by exact prompt name"),
     label: str | None = Field(None, description="Filter by label (e.g., 'production', 'staging')"),
     tag: str | None = Field(None, description="Filter by tag"),
@@ -2563,7 +2615,7 @@ async def list_prompts(
             api_kwargs["tag"] = tag
 
         # Call prompts list API
-        response = state.langfuse_client.api.prompts.list(**api_kwargs)
+        response = state.get_client(env).api.prompts.list(**api_kwargs)
 
         # Extract items and pagination
         items, pagination = _extract_items_from_response(response)
@@ -2603,6 +2655,7 @@ async def list_prompts(
 
 async def create_text_prompt(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="The name of the prompt to create"),
     prompt: str = Field(..., description="Prompt text content (supports {{variables}})"),
     labels: list[str] | None = Field(None, description="Labels to assign (e.g., ['production', 'staging'])"),
@@ -2649,7 +2702,7 @@ async def create_text_prompt(
         if commit_message is not None:
             create_kwargs["commit_message"] = commit_message
 
-        created_prompt = state.langfuse_client.create_prompt(**create_kwargs)
+        created_prompt = state.get_client(env).create_prompt(**create_kwargs)
 
         result = {
             "name": getattr(created_prompt, "name", name),
@@ -2675,6 +2728,7 @@ async def create_text_prompt(
 
 async def create_chat_prompt(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="The name of the prompt to create"),
     prompt: list[dict[str, Any]] = Field(
         ..., description="Chat messages in the format [{role: 'system'|'user'|'assistant', content: '...'}]"
@@ -2721,7 +2775,7 @@ async def create_chat_prompt(
         if commit_message is not None:
             create_kwargs["commit_message"] = commit_message
 
-        created_prompt = state.langfuse_client.create_prompt(**create_kwargs)
+        created_prompt = state.get_client(env).create_prompt(**create_kwargs)
 
         prompt_content = None
         if hasattr(created_prompt, "prompt"):
@@ -2753,6 +2807,7 @@ async def create_chat_prompt(
 
 async def update_prompt_labels(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="The name of the prompt to update"),
     version: int = Field(..., ge=1, description="The prompt version to update"),
     labels: list[str] = Field(
@@ -2780,10 +2835,10 @@ async def update_prompt_labels(
 
         def _get_existing_labels() -> list[str]:
             try:
-                if hasattr(state.langfuse_client, "get_prompt"):
-                    prompt_obj = state.langfuse_client.get_prompt(name=name, version=version)
-                elif hasattr(state.langfuse_client, "api") and hasattr(state.langfuse_client.api, "prompts"):
-                    prompt_obj = _prompts_get(state.langfuse_client.api.prompts, name=name, version=version)
+                if hasattr(state.get_client(env), "get_prompt"):
+                    prompt_obj = state.get_client(env).get_prompt(name=name, version=version)
+                elif hasattr(state.get_client(env), "api") and hasattr(state.get_client(env).api, "prompts"):
+                    prompt_obj = _prompts_get(state.get_client(env).api.prompts, name=name, version=version)
                 else:
                     prompt_obj = None
             except Exception as exc:
@@ -2815,10 +2870,10 @@ async def update_prompt_labels(
                 return None
 
         updated_prompt = None
-        if hasattr(state.langfuse_client, "update_prompt"):
-            updated_prompt = _try_update(state.langfuse_client.update_prompt)
-        elif hasattr(state.langfuse_client, "api"):
-            api = state.langfuse_client.api
+        if hasattr(state.get_client(env), "update_prompt"):
+            updated_prompt = _try_update(state.get_client(env).update_prompt)
+        elif hasattr(state.get_client(env), "api"):
+            api = state.get_client(env).api
             for attr in ("prompt_version", "promptVersion", "prompt_versions", "promptVersions"):
                 if not hasattr(api, attr):
                     continue
@@ -2855,6 +2910,7 @@ async def update_prompt_labels(
 
 async def list_datasets(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     page: int = Field(1, ge=1, description="Page number for pagination (starts at 1)"),
     limit: int = Field(50, ge=1, le=100, description="Items per page (max 100)"),
 ) -> ResponseDict:
@@ -2879,7 +2935,7 @@ async def list_datasets(
         page = _normalize_field_default(page) or 1
         limit = _normalize_field_default(limit) or 50
 
-        response = state.langfuse_client.api.datasets.list(page=page, limit=limit)
+        response = state.get_client(env).api.datasets.list(page=page, limit=limit)
 
         items, pagination = _extract_items_from_response(response)
         raw_datasets = [_sdk_object_to_python(d) for d in items]
@@ -2917,6 +2973,7 @@ async def list_datasets(
 
 async def get_dataset(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="The name of the dataset to fetch"),
 ) -> ResponseDict:
     """Get a specific dataset by name.
@@ -2939,7 +2996,7 @@ async def get_dataset(
     state = cast(MCPState, ctx.request_context.lifespan_context)
 
     try:
-        dataset = state.langfuse_client.api.datasets.get(dataset_name=name)
+        dataset = state.get_client(env).api.datasets.get(dataset_name=name)
 
         if dataset is None:
             raise LookupError(f"Dataset '{name}' not found")
@@ -2960,6 +3017,7 @@ async def get_dataset(
 
 async def list_dataset_items(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     dataset_name: str = Field(..., description="The name of the dataset to list items from"),
     source_trace_id: str | None = Field(None, description="Filter by source trace ID"),
     source_observation_id: str | None = Field(None, description="Filter by source observation ID"),
@@ -3007,7 +3065,7 @@ async def list_dataset_items(
         if source_observation_id:
             api_kwargs["source_observation_id"] = source_observation_id
 
-        response = state.langfuse_client.api.dataset_items.list(**api_kwargs)
+        response = state.get_client(env).api.dataset_items.list(**api_kwargs)
 
         items, pagination = _extract_items_from_response(response)
         raw_items = [_sdk_object_to_python(item) for item in items]
@@ -3043,6 +3101,7 @@ async def list_dataset_items(
 
 async def get_dataset_item(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     item_id: str = Field(..., description="The ID of the dataset item to fetch"),
     output_mode: OUTPUT_MODE_LITERAL = Field(
         "compact",
@@ -3072,7 +3131,7 @@ async def get_dataset_item(
     state = cast(MCPState, ctx.request_context.lifespan_context)
 
     try:
-        item = state.langfuse_client.api.dataset_items.get(id=item_id)
+        item = state.get_client(env).api.dataset_items.get(id=item_id)
 
         if item is None:
             raise LookupError(f"Dataset item '{item_id}' not found")
@@ -3103,6 +3162,7 @@ async def get_dataset_item(
 
 async def create_dataset(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     name: str = Field(..., description="Name for the new dataset (must be unique in project)"),
     description: str | None = Field(None, description="Optional description of the dataset"),
     metadata: dict[str, Any] | None = Field(None, description="Optional custom metadata as key-value pairs"),
@@ -3133,13 +3193,13 @@ async def create_dataset(
         metadata = _normalize_field_default(metadata)
 
         # Use the high-level SDK method if available, otherwise use API directly
-        if hasattr(state.langfuse_client, "create_dataset"):
+        if hasattr(state.get_client(env), "create_dataset"):
             kwargs: dict[str, Any] = {"name": name}
             if description:
                 kwargs["description"] = description
             if metadata:
                 kwargs["metadata"] = metadata
-            dataset = state.langfuse_client.create_dataset(**kwargs)
+            dataset = state.get_client(env).create_dataset(**kwargs)
         else:
             from langfuse.api.resources.datasets.types.create_dataset_request import CreateDatasetRequest
 
@@ -3148,7 +3208,7 @@ async def create_dataset(
                 description=description,
                 metadata=metadata,
             )
-            dataset = state.langfuse_client.api.datasets.create(request=request)
+            dataset = state.get_client(env).api.datasets.create(request=request)
 
         result = _sdk_object_to_python(dataset)
 
@@ -3166,6 +3226,7 @@ async def create_dataset(
 
 async def create_dataset_item(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     dataset_name: str = Field(..., description="Name of the dataset to add the item to"),
     input: Any = Field(None, description="Input data for the dataset item (any JSON-serializable value)"),
     expected_output: Any = Field(None, description="Expected output data for evaluation (any JSON-serializable value)"),
@@ -3207,7 +3268,7 @@ async def create_dataset_item(
         status = _normalize_field_default(status)
 
         # Use the high-level SDK method if available
-        if hasattr(state.langfuse_client, "create_dataset_item"):
+        if hasattr(state.get_client(env), "create_dataset_item"):
             kwargs: dict[str, Any] = {"dataset_name": dataset_name}
             if input is not None:
                 kwargs["input"] = input
@@ -3223,7 +3284,7 @@ async def create_dataset_item(
                 kwargs["id"] = item_id
             if status:
                 kwargs["status"] = status
-            item = state.langfuse_client.create_dataset_item(**kwargs)
+            item = state.get_client(env).create_dataset_item(**kwargs)
         else:
             from langfuse.api.resources.dataset_items.types.create_dataset_item_request import CreateDatasetItemRequest
 
@@ -3246,7 +3307,7 @@ async def create_dataset_item(
                 request_kwargs["status"] = DatasetStatus(status)
 
             request = CreateDatasetItemRequest(**request_kwargs)
-            item = state.langfuse_client.api.dataset_items.create(request=request)
+            item = state.get_client(env).api.dataset_items.create(request=request)
 
         result = _sdk_object_to_python(item)
 
@@ -3264,6 +3325,7 @@ async def create_dataset_item(
 
 async def delete_dataset_item(
     ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
     item_id: str = Field(..., description="The ID of the dataset item to delete"),
 ) -> ResponseDict:
     """Delete a dataset item by ID.
@@ -3280,7 +3342,7 @@ async def delete_dataset_item(
     state = cast(MCPState, ctx.request_context.lifespan_context)
 
     try:
-        response = state.langfuse_client.api.dataset_items.delete(id=item_id)
+        response = state.get_client(env).api.dataset_items.delete(id=item_id)
 
         result = _sdk_object_to_python(response) if response else {}
 
@@ -3297,9 +3359,8 @@ async def delete_dataset_item(
 
 
 def app_factory(
-    public_key: str,
-    secret_key: str,
-    host: str,
+    env_configs: dict[str, dict[str, str]],
+    default_env: str,
     cache_size: int = 100,
     dump_dir: str | None = None,
     enabled_tools: set[str] | None = None,
@@ -3309,9 +3370,8 @@ def app_factory(
     """Create a FastMCP server with Langfuse tools.
 
     Args:
-        public_key: Langfuse public key
-        secret_key: Langfuse secret key
-        host: Langfuse API host URL
+        env_configs: Dict of env_name -> {"public_key", "secret_key", "host"} for each environment.
+        default_env: Default environment name when 'env' param is omitted.
         cache_size: Size of LRU caches
         dump_dir: Directory for full_json_file output mode
         enabled_tools: Tool groups to enable (default: all). Options: traces, observations, sessions, exceptions, prompts, datasets, schema
@@ -3328,21 +3388,26 @@ def app_factory(
     @asynccontextmanager
     async def lifespan(server: FastMCP) -> AsyncIterator[MCPState]:
         init_params = inspect.signature(Langfuse.__init__).parameters
-        langfuse_kwargs = {
-            "public_key": public_key,
-            "secret_key": secret_key,
-            "host": host,
-            "debug": False,
-            "flush_at": 0,
-            "flush_interval": None,
-        }
-        if "timeout" in init_params:
-            langfuse_kwargs["timeout"] = timeout
-        if "tracing_enabled" in init_params:
-            langfuse_kwargs["tracing_enabled"] = False
+        clients: dict[str, Langfuse] = {}
+        for env_name, env_cfg in env_configs.items():
+            langfuse_kwargs = {
+                "public_key": env_cfg["public_key"],
+                "secret_key": env_cfg["secret_key"],
+                "host": env_cfg.get("host", "https://cloud.langfuse.com"),
+                "debug": False,
+                "flush_at": 0,
+                "flush_interval": None,
+            }
+            if "timeout" in init_params:
+                langfuse_kwargs["timeout"] = timeout
+            if "tracing_enabled" in init_params:
+                langfuse_kwargs["tracing_enabled"] = False
+            clients[env_name] = Langfuse(**langfuse_kwargs)
+            logger.info(f"Created Langfuse client for env '{env_name}' -> {env_cfg.get('host')}")
 
         state = MCPState(
-            langfuse_client=Langfuse(**langfuse_kwargs),
+            clients=clients,
+            default_env=default_env,
             observation_cache=LRUCache(maxsize=cache_size),
             file_to_observations_map=LRUCache(maxsize=cache_size),
             exception_type_map=LRUCache(maxsize=cache_size),
@@ -3352,9 +3417,11 @@ def app_factory(
         try:
             yield state
         finally:
-            logger.info("Cleaning up Langfuse client")
-            state.langfuse_client.flush()
-            state.langfuse_client.shutdown()
+            logger.info("Cleaning up Langfuse clients")
+            for env_name, client in state.clients.items():
+                client.flush()
+                client.shutdown()
+                logger.info(f"Shut down client for env '{env_name}'")
 
     mcp = FastMCP("Langfuse MCP Server", lifespan=lifespan)
 
@@ -3447,14 +3514,30 @@ def main():
             logger.warning("No valid tool groups provided; defaulting to all tools.")
             enabled_tools = ALL_TOOL_GROUPS
 
+    # Load multi-env config or fall back to single-env from CLI args
+    multi_env_config = _load_multi_env_config()
+    if multi_env_config:
+        env_configs = multi_env_config["environments"]
+        default_env = multi_env_config.get("default_env", next(iter(env_configs)))
+        logger.info(f"Multi-env mode: envs={list(env_configs.keys())} default={default_env}")
+    else:
+        env_configs = {
+            "default": {
+                "public_key": args.public_key,
+                "secret_key": args.secret_key,
+                "host": args.host,
+            }
+        }
+        default_env = "default"
+        logger.info(f"Single-env mode: host={args.host}")
+
     logger.info(
-        f"Starting MCP - host:{args.host} timeout:{args.timeout}s cache:{args.cache_size} "
+        f"Starting MCP - timeout:{args.timeout}s cache:{args.cache_size} "
         f"tools:{sorted(enabled_tools)} read_only:{args.read_only}"
     )
     app = app_factory(
-        public_key=args.public_key,
-        secret_key=args.secret_key,
-        host=args.host,
+        env_configs=env_configs,
+        default_env=default_env,
         cache_size=args.cache_size,
         dump_dir=args.dump_dir,
         enabled_tools=enabled_tools,

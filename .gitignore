@@ -179,6 +179,7 @@ data/
 
 # Project specific
 .cursor/mcp.json
+config.json
 
 run_mcp.py
 dump/
