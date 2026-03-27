@@ -38,12 +38,50 @@ Copy `config.example.json` and fill in your credentials:
 
 ### 2. Register with Claude Code
 
+#### Option A: Multi-environment (with `config.json`)
+
 ```bash
-claude mcp add langfuse \
-  -e LANGFUSE_MCP_CONFIG=/path/to/langfuse_mcp/config.json \
-  -- /path/to/langfuse_mcp/.venv/bin/langfuse-mcp \
-  --tools traces,observations,sessions,exceptions,prompts --read-only
+# User-scoped (available in all projects)
+claude mcp add --transport stdio --scope user \
+  --env LANGFUSE_MCP_CONFIG=/absolute/path/to/langfuse-mcp/config.json \
+  langfuse \
+  -- /absolute/path/to/langfuse-mcp/.venv/bin/langfuse-mcp
+
+# Project-scoped (shared via .mcp.json checked into git)
+claude mcp add --transport stdio --scope project \
+  --env LANGFUSE_MCP_CONFIG=/absolute/path/to/langfuse-mcp/config.json \
+  langfuse \
+  -- /absolute/path/to/langfuse-mcp/.venv/bin/langfuse-mcp
 ```
+
+#### Option B: Single-environment (env vars only, no config.json)
+
+```bash
+claude mcp add --transport stdio --scope user \
+  --env LANGFUSE_PUBLIC_KEY=pk-lf-... \
+  --env LANGFUSE_SECRET_KEY=sk-lf-... \
+  --env LANGFUSE_HOST=https://cloud.langfuse.com \
+  langfuse \
+  -- /absolute/path/to/langfuse-mcp/.venv/bin/langfuse-mcp
+```
+
+#### Optional flags
+
+Append these after the `--` separator to customize behavior:
+
+```bash
+  -- /path/to/.venv/bin/langfuse-mcp \
+  --tools traces,observations,sessions,exceptions,prompts \  # load specific tool groups
+  --read-only                                                 # disable write operations
+```
+
+#### Verify it works
+
+```bash
+claude mcp list          # confirm "langfuse" appears
+```
+
+Inside a Claude Code session, run `/mcp` to check server status and available tools.
 
 ### 3. Use the `env` parameter
 
