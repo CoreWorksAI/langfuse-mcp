@@ -970,6 +970,8 @@ class MCPState:
 
     def get_client(self, env: str | None = None) -> Langfuse:
         """Get Langfuse client for the specified environment."""
+        if not isinstance(env, str):
+            env = self.default_env
         env = env or self.default_env
         if env not in self.clients:
             raise ValueError(f"Unknown env '{env}'. Available: {list(self.clients.keys())}")

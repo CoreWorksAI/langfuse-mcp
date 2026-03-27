@@ -44,7 +44,11 @@ def test_cli_requires_keys_without_env(monkeypatch):
     monkeypatch.delenv("LANGFUSE_LOG_TO_CONSOLE", raising=False)
     monkeypatch.delenv("LANGFUSE_HOST", raising=False)
 
+    import langfuse_mcp.__main__ as main_mod
     from langfuse_mcp.__main__ import _build_arg_parser, _read_env_defaults
+
+    # Ensure no config.json is found so keys remain required
+    monkeypatch.setattr(main_mod, "_load_multi_env_config", lambda: None)
 
     parser = _build_arg_parser(_read_env_defaults())
     with pytest.raises(SystemExit):
