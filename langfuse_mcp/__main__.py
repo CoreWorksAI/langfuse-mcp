@@ -36,7 +36,7 @@ from pydantic import AfterValidator, BaseModel, Field
 try:
     from pydantic.fields import FieldInfo
 except ImportError:  # pragma: no cover - pydantic stubbed in tests
-    FieldInfo = None
+    FieldInfo = None  # type: ignore[assignment, misc]
 
 try:
     __version__ = version("langfuse-mcp")
@@ -430,7 +430,7 @@ def _prompts_get(prompts_client: Any, *, name: str, **kwargs: Any) -> Any:
     try:
         params = inspect.signature(prompts_client.get).parameters
     except (TypeError, ValueError):
-        params = {}
+        params = {}  # type: ignore[assignment]
 
     call_kwargs = dict(kwargs)
     if "prompt_name" in params:
@@ -738,7 +738,7 @@ def truncate_large_strings(
         return result, result_size
 
     elif isinstance(obj, list):
-        result = []
+        list_result: list[Any] = []
         result_size = 2  # Count brackets
 
         # Special handling for empty lists
@@ -772,8 +772,8 @@ def truncate_large_strings(
         # Process items with appropriate truncation level
         for i, item in enumerate(obj):
             if will_need_item_limit and i >= max_items:
-                result.append({"_note": f"List truncated, {len(obj) - i} of {len(obj)} items omitted due to size constraints"})
-                result_size += 2 + len(result[-1]["_note"])
+                list_result.append({"_note": f"List truncated, {len(obj) - i} of {len(obj)} items omitted due to size constraints"})
+                result_size += 2 + len(list_result[-1]["_note"])
                 break
 
             item_truncation_level = target_truncation_level
@@ -784,12 +784,12 @@ def truncate_large_strings(
             processed_item, item_size = truncate_large_strings(
                 item, adjusted_max_length, max_response_size, f"{path}[{i}]", current_size + result_size, item_truncation_level
             )
-            result.append(processed_item)
+            list_result.append(processed_item)
             result_size += item_size
             if i < len(obj) - 1:
                 result_size += 1  # Count comma
 
-        return result, result_size
+        return list_result, result_size
 
     elif isinstance(obj, str):
         # String truncation strategy based on truncation level
@@ -1047,6 +1047,7 @@ async def _efficient_fetch_observations(
         from_timestamp: Start time
         to_timestamp: End time
         filepath: Optional filter by filepath
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
 
     Returns:
         Dictionary of observation_id -> observation
@@ -1079,7 +1080,7 @@ async def _efficient_fetch_observations(
     # Process observations and build indices
     observations: dict[str, Any] = {}
     for obs in observation_items:
-        events = []
+        events: list[Any] = []
         if hasattr(obs, "events"):
             events = getattr(obs, "events") or []
         elif isinstance(obs, dict):
@@ -1132,6 +1133,7 @@ async def _embed_observations_in_traces(state: MCPState, traces: list[Any], env:
     Args:
         state: MCP state with Langfuse client
         traces: List of trace objects to process
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
     """
     if not traces:
         return
@@ -1294,6 +1296,7 @@ async def fetch_trace(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         trace_id: The ID of the trace to fetch (unique identifier string)
         include_observations: If True, fetch and include the full observation objects instead of just IDs.
             Use this when you need access to system prompts, model parameters, or other details stored
@@ -1388,6 +1391,7 @@ async def fetch_observations(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         type: The observation type to filter by (SPAN, GENERATION, or EVENT)
         age: Minutes ago to start looking (e.g., 1440 for 24 hours)
         name: Optional name filter (string pattern to match)
@@ -1477,6 +1481,7 @@ async def fetch_observation(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         observation_id: The ID of the observation to fetch (unique identifier string)
         output_mode: Controls the output format and detail level
 
@@ -1535,6 +1540,7 @@ async def fetch_sessions(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         age: Minutes ago to start looking (e.g., 1440 for 24 hours)
         page: Page number for pagination (starts at 1)
         limit: Maximum number of sessions to return per page
@@ -1615,6 +1621,7 @@ async def get_session_details(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         session_id: The ID of the session to retrieve (unique identifier string)
         include_observations: If True, fetch and include the full observation objects instead of just IDs.
             Use this when you need access to system prompts, model parameters, or other details stored
@@ -1733,6 +1740,7 @@ async def get_user_sessions(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         user_id: The ID of the user to retrieve sessions for (unique identifier string)
         age: Minutes ago to start looking (e.g., 1440 for 24 hours)
         include_observations: If True, fetch and include the full observation objects instead of just IDs.
@@ -1865,6 +1873,7 @@ async def find_exceptions(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         age: Number of minutes to look back (positive integer, max 7 days/10080 minutes)
         group_by: How to group exceptions - "file" groups by filename, "function" groups by function name,
                   or "type" groups by exception type
@@ -1897,7 +1906,7 @@ async def find_exceptions(
         )
 
         # Process observations to find and group exceptions
-        exception_groups = Counter()
+        exception_groups: Counter[str] = Counter()
 
         for observation in (_sdk_object_to_python(obs) for obs in observation_items):
             events = observation.get("events", []) if isinstance(observation, dict) else []
@@ -1960,6 +1969,7 @@ async def find_exceptions_in_file(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         filepath: Path to the file to search for exceptions (full path including extension)
         age: Number of minutes to look back (positive integer, max 7 days/10080 minutes)
         output_mode: Controls the output format and detail level
@@ -2074,6 +2084,7 @@ async def get_exception_details(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         trace_id: The ID of the trace to analyze for exceptions (unique identifier string)
         span_id: Optional span ID to filter by specific span (unique identifier string)
         output_mode: Controls the output format and detail level
@@ -2206,6 +2217,7 @@ async def get_error_count(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         age: Number of minutes to look back (positive integer, max 7 days/10080 minutes)
 
     Returns:
@@ -2275,11 +2287,16 @@ async def get_error_count(
         raise
 
 
-async def get_data_schema(ctx: Context, env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."), dummy: str = "") -> str:
+async def get_data_schema(
+    ctx: Context,
+    env: str | None = Field(None, description="Environment to query (e.g. dev, prod, local). Omit for default."),
+    dummy: str = "",
+) -> str:
     """Get schema of trace, span and event objects.
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         dummy: Unused parameter for API compatibility (can be left empty)
 
     Returns:
@@ -2409,6 +2426,7 @@ async def get_prompt(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         name: The name of the prompt to fetch
         label: Optional label to fetch (e.g., 'production'). Cannot be used with version.
         version: Optional specific version number. Cannot be used with label.
@@ -2513,6 +2531,7 @@ async def get_prompt_unresolved(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         name: The name of the prompt to fetch
         label: Optional label to fetch. Cannot be used with version.
         version: Optional specific version number. Cannot be used with label.
@@ -2590,6 +2609,7 @@ async def list_prompts(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         name: Optional filter by exact prompt name
         label: Optional filter by label on any version
         tag: Optional filter by tag
@@ -2922,6 +2942,7 @@ async def list_datasets(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         page: Page number for pagination (starts at 1)
         limit: Maximum items per page (max 100)
 
@@ -2984,6 +3005,7 @@ async def get_dataset(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         name: The name of the dataset to fetch
 
     Returns:
@@ -3036,6 +3058,7 @@ async def list_dataset_items(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         dataset_name: The name of the dataset to list items from
         source_trace_id: Optional filter by source trace ID
         source_observation_id: Optional filter by source observation ID
@@ -3116,6 +3139,7 @@ async def get_dataset_item(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         item_id: The ID of the dataset item to fetch
         output_mode: How to format the response data
 
@@ -3175,6 +3199,7 @@ async def create_dataset(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         name: Name for the new dataset (must be unique)
         description: Optional description
         metadata: Optional custom metadata
@@ -3245,6 +3270,7 @@ async def create_dataset_item(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         dataset_name: Name of the target dataset
         input: Input data for the item
         expected_output: Expected output for evaluation
@@ -3336,6 +3362,7 @@ async def delete_dataset_item(
 
     Args:
         ctx: Context object containing lifespan context with Langfuse client
+        env: Environment to query (e.g. dev, prod, local). Defaults to the configured default.
         item_id: The ID of the dataset item to delete
 
     Returns:
@@ -3404,7 +3431,7 @@ def app_factory(
                 langfuse_kwargs["timeout"] = timeout
             if "tracing_enabled" in init_params:
                 langfuse_kwargs["tracing_enabled"] = False
-            clients[env_name] = Langfuse(**langfuse_kwargs)
+            clients[env_name] = Langfuse(**langfuse_kwargs)  # type: ignore[arg-type]
             logger.info(f"Created Langfuse client for env '{env_name}' -> {env_cfg.get('host')}")
 
         state = MCPState(
@@ -3467,7 +3494,7 @@ def app_factory(
                     if read_only and tool_name in WRITE_TOOLS:
                         skipped_write.append(tool_name)
                         continue
-                    mcp.tool()(tool_funcs[tool_name])
+                    mcp.tool()(tool_funcs[tool_name])  # type: ignore[arg-type]
                     registered.append(tool_name)
 
     if read_only and skipped_write:
@@ -3520,7 +3547,7 @@ def main():
     multi_env_config = _load_multi_env_config()
     if multi_env_config:
         env_configs = multi_env_config["environments"]
-        default_env = multi_env_config.get("default_env", next(iter(env_configs)))
+        default_env = multi_env_config.get("default_env") or next(iter(env_configs))
         logger.info(f"Multi-env mode: envs={list(env_configs.keys())} default={default_env}")
     else:
         env_configs = {
@@ -3533,10 +3560,7 @@ def main():
         default_env = "default"
         logger.info(f"Single-env mode: host={args.host}")
 
-    logger.info(
-        f"Starting MCP - timeout:{args.timeout}s cache:{args.cache_size} "
-        f"tools:{sorted(enabled_tools)} read_only:{args.read_only}"
-    )
+    logger.info(f"Starting MCP - timeout:{args.timeout}s cache:{args.cache_size} tools:{sorted(enabled_tools)} read_only:{args.read_only}")
     app = app_factory(
         env_configs=env_configs,
         default_env=default_env,
