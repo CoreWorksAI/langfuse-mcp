@@ -45,7 +45,8 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-mock",
-    "pyright",
+    "mypy",
+    "types-cachetools",
     "ruff",
 ]
 

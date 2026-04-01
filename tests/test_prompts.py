@@ -14,7 +14,7 @@ def state(tmp_path):
     """Return an MCPState instance using the fake client."""
     from langfuse_mcp.__main__ import MCPState
 
-    return MCPState(langfuse_client=FakeLangfuse(), dump_dir=str(tmp_path))
+    return MCPState(clients={"default": FakeLangfuse()}, default_env="default", dump_dir=str(tmp_path))
 
 
 def test_create_text_prompt(state):
